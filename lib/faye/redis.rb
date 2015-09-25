@@ -38,7 +38,9 @@ module Faye
       elsif socket
         @redis = EventMachine::Hiredis::Client.new(socket, nil, auth, db).connect
       else
-        @redis = EventMachine::Hiredis::Client.new(host, port, auth, db).connect
+        @redis = RedisPool.new do
+          EventMachine::Hiredis::Client.new(host, port, auth, db).connect
+        end
       end
       @subscriber = @redis.pubsub
 
@@ -65,7 +67,7 @@ module Faye
     def create_client(&callback)
       init
       client_id = @server.generate_id
-      @redis.zadd(@ns + '/clients', 0, client_id) do |added|
+      @redis.zadd(@ns + '/clients', get_current_time, client_id) do |added|
         next create_client(&callback) if added == 0
         @server.debug 'Created new client ?', client_id
         ping(client_id)
@@ -174,13 +176,17 @@ module Faye
 
       key = @ns + "/clients/#{client_id}/messages"
 
-      @redis.multi
-      @redis.lrange(key, 0, -1)
-      @redis.del(key)
-      @redis.exec.callback  do |json_messages, deleted|
-        next unless json_messages
-        messages = json_messages.map { |json| MultiJson.load(json) }
-        @server.deliver(client_id, messages)
+      @redis.with_block do |connection|
+        connection.multi
+        connection.lrange(key, 0, -1)
+        connection.del(key)
+        connection.exec.callback  do |json_messages, deleted|
+          next unless json_messages
+          messages = json_messages.map { |json| MultiJson.load(json) }
+          if not @server.deliver(client_id, messages)
+            connection.rpush(key, *json_messages)
+          end
+        end
       end
     end
 
@@ -201,6 +207,7 @@ module Faye
           next release_lock.call if i == n
 
           clients.each do |client_id|
+            @server.trigger(:timeout, client_id)
             destroy_client(client_id) do
               i += 1
               release_lock.call if i == n
